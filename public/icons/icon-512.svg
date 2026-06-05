@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="TrackForge icon">
+  <rect width="512" height="512" rx="112" fill="#07070a"/>
+  <path d="M120 334c45-83 80-149 107-200 14-25 48-25 62 0 27 51 62 117 107 200" fill="none" stroke="#b8ff4d" stroke-width="40" stroke-linecap="round"/>
+  <circle cx="166" cy="342" r="46" fill="#48e5c2"/>
+  <circle cx="346" cy="342" r="46" fill="#ff4d8d"/>
+  <path d="M203 260h106" stroke="#ffffff" stroke-width="27" stroke-linecap="round"/>
+</svg>
