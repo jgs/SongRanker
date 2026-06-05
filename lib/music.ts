@@ -23,6 +23,9 @@ export type Song = {
   notes: string;
   ratings: Ratings;
   manualRank: number;
+  spotifyId?: string;
+  albumArtUrl?: string;
+  source?: "manual" | "spotify" | "csv" | "sample";
 };
 
 export type Library = {
@@ -63,7 +66,10 @@ export function createSong(input: Partial<Song>): Song {
     link: input.link ?? "",
     notes: input.notes ?? "",
     ratings: { ...defaultRatings, ...input.ratings },
-    manualRank: input.manualRank ?? 1
+    manualRank: input.manualRank ?? 1,
+    spotifyId: input.spotifyId,
+    albumArtUrl: input.albumArtUrl,
+    source: input.source ?? "manual"
   };
 }
 
@@ -93,7 +99,7 @@ export function loadLibrary(): Library {
   try {
     const parsed = JSON.parse(saved) as Library;
     return {
-      songs: parsed.songs?.map((song, index) => createSong({ ...song, manualRank: song.manualRank ?? index + 1 })) ?? sampleSongs,
+      songs: parsed.songs?.map((song, index) => createSong({ ...song, manualRank: song.manualRank ?? index + 1, source: song.source ?? "manual" })) ?? sampleSongs,
       weights: { ...DEFAULT_WEIGHTS, ...parsed.weights }
     };
   } catch {
@@ -119,6 +125,9 @@ export function serializeCsv(songs: Song[]) {
     "genre",
     "link",
     "notes",
+    "spotifyId",
+    "albumArtUrl",
+    "source",
     ...CRITERIA.map((criterion) => criterion.key),
     "manualRank"
   ];
@@ -131,6 +140,9 @@ export function serializeCsv(songs: Song[]) {
       song.genre,
       song.link,
       song.notes,
+      song.spotifyId ?? "",
+      song.albumArtUrl ?? "",
+      song.source ?? "manual",
       ...CRITERIA.map((criterion) => String(song.ratings[criterion.key])),
       String(song.manualRank)
     ];
@@ -161,6 +173,9 @@ export function deserializeCsv(csv: string) {
         genre: record.genre,
         link: record.link,
         notes: record.notes,
+        spotifyId: record.spotifyId,
+        albumArtUrl: record.albumArtUrl,
+        source: "csv",
         ratings,
         manualRank: Number(record.manualRank) || index + 1
       });
@@ -216,7 +231,7 @@ function randomId() {
 }
 
 export const sampleSongs: Song[] = [
-  createSong({ title: "Everything In Its Right Place", artist: "Radiohead", album: "Kid A", year: 2000, genre: "Art Rock", link: "https://open.spotify.com/", notes: "The reset button. Cold, strange, and completely alive.", ratings: { emotionalImpact: 10, replayValue: 9, lyrics: 8, production: 10, originality: 10, personalMemories: 9, overallEnjoyment: 10 }, manualRank: 1 }),
+  createSong({ title: "Everything In Its Right Place", artist: "Radiohead", album: "Kid A", year: 2000, genre: "Art Rock", link: "https://open.spotify.com/", notes: "The reset button. Cold, strange, and completely alive.", ratings: { emotionalImpact: 10, replayValue: 9, lyrics: 8, production: 10, originality: 10, personalMemories: 9, overallEnjoyment: 10 }, manualRank: 1, source: "sample" }),
   createSong({ title: "Run Away With Me", artist: "Carly Rae Jepsen", album: "E-MO-TION", year: 2015, genre: "Pop", link: "https://open.spotify.com/", notes: "Saxophone ignition, windows down.", ratings: { emotionalImpact: 9, replayValue: 10, lyrics: 8, production: 9, originality: 8, personalMemories: 9, overallEnjoyment: 10 }, manualRank: 2 }),
   createSong({ title: "Nights", artist: "Frank Ocean", album: "Blonde", year: 2016, genre: "R&B", link: "https://open.spotify.com/", notes: "Two lives stitched together by a beat switch.", ratings: { emotionalImpact: 10, replayValue: 10, lyrics: 10, production: 10, originality: 10, personalMemories: 8, overallEnjoyment: 10 }, manualRank: 3 }),
   createSong({ title: "All My Friends", artist: "LCD Soundsystem", album: "Sound of Silver", year: 2007, genre: "Dance Punk", link: "https://open.spotify.com/", notes: "Aging, sprinting, laughing, refusing to leave.", ratings: { emotionalImpact: 10, replayValue: 9, lyrics: 10, production: 9, originality: 9, personalMemories: 9, overallEnjoyment: 10 }, manualRank: 4 }),
@@ -236,4 +251,4 @@ export const sampleSongs: Song[] = [
   createSong({ title: "Time to Pretend", artist: "MGMT", album: "Oracular Spectacular", year: 2007, genre: "Synth Pop", link: "https://open.spotify.com/", notes: "Naive fantasy with a shadow under it.", ratings: { emotionalImpact: 8, replayValue: 10, lyrics: 9, production: 9, originality: 9, personalMemories: 9, overallEnjoyment: 9 }, manualRank: 18 }),
   createSong({ title: "Fast Car", artist: "Tracy Chapman", album: "Tracy Chapman", year: 1988, genre: "Folk Rock", link: "https://open.spotify.com/", notes: "Plainspoken hope, perfectly framed.", ratings: { emotionalImpact: 10, replayValue: 9, lyrics: 10, production: 8, originality: 9, personalMemories: 8, overallEnjoyment: 10 }, manualRank: 19 }),
   createSong({ title: "Let Down", artist: "Radiohead", album: "OK Computer", year: 1997, genre: "Alternative", link: "https://open.spotify.com/", notes: "The lift-off still arrives every time.", ratings: { emotionalImpact: 10, replayValue: 9, lyrics: 9, production: 9, originality: 9, personalMemories: 9, overallEnjoyment: 10 }, manualRank: 20 })
-];
+].map((song) => ({ ...song, source: "sample" }));

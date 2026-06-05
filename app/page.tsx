@@ -7,6 +7,7 @@ import {
   GripVertical,
   Headphones,
   Import,
+  Loader2,
   ListMusic,
   Medal,
   Music2,
@@ -37,8 +38,17 @@ import {
   serializeCsv,
   sortedByWeightedScore
 } from "@/lib/music";
+import {
+  SpotifyPlaylistPreview,
+  disconnectSpotify,
+  fetchSpotifyPlaylistPreview,
+  findImportDuplicate,
+  getSpotifyClientId,
+  getStoredSpotifyTokens,
+  startSpotifyLogin
+} from "@/lib/spotify";
 
-type View = "archive" | "top100" | "compare" | "progress" | "data";
+type View = "archive" | "top100" | "compare" | "progress" | "spotify" | "data";
 type NavItem = [View, string, LucideIcon];
 
 const emptyForm = createSong({
@@ -60,12 +70,20 @@ export default function Home() {
   const [comparePair, setComparePair] = useState<[Song, Song] | null>(null);
   const [notice, setNotice] = useState("Sample archive loaded locally.");
   const [loaded, setLoaded] = useState(false);
+  const [spotifyConnected, setSpotifyConnected] = useState(false);
+  const [spotifyPreview, setSpotifyPreview] = useState<SpotifyPlaylistPreview | null>(null);
+  const [selectedSpotifyIds, setSelectedSpotifyIds] = useState<Set<string>>(new Set());
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
 
   useEffect(() => {
     const library = loadLibrary();
     setSongs(library.songs);
     setWeights(library.weights);
+    setSpotifyConnected(Boolean(getStoredSpotifyTokens()));
+    const params = new URLSearchParams(window.location.search);
+    const requestedView = params.get("view");
+    if (requestedView === "spotify") setView("spotify");
+    if (params.get("spotify") === "connected") setNotice("Spotify connected. Paste a playlist URL to import.");
     setLoaded(true);
   }, []);
 
@@ -102,7 +120,7 @@ export default function Home() {
       setNotice(`Updated ${form.title}.`);
     } else {
       const nextRank = songs.length ? Math.max(...songs.map((song) => song.manualRank)) + 1 : 1;
-      setSongs((current) => [...current, { ...form, id: crypto.randomUUID(), manualRank: nextRank }]);
+      setSongs((current) => [...current, { ...form, id: crypto.randomUUID(), manualRank: nextRank, source: "manual" }]);
       setNotice(`Added ${form.title}.`);
     }
     resetForm();
@@ -179,6 +197,69 @@ export default function Home() {
     });
   }
 
+  async function connectSpotify() {
+    try {
+      await startSpotifyLogin();
+    } catch (caught) {
+      setNotice(caught instanceof Error ? caught.message : "Could not start Spotify login.");
+    }
+  }
+
+  function disconnectFromSpotify() {
+    disconnectSpotify();
+    setSpotifyConnected(false);
+    setSpotifyPreview(null);
+    setSelectedSpotifyIds(new Set());
+    setNotice("Spotify disconnected.");
+  }
+
+  async function loadSpotifyPreview(playlistUrl: string) {
+    try {
+      setNotice("Loading Spotify playlist...");
+      const preview = await fetchSpotifyPlaylistPreview(playlistUrl);
+      setSpotifyPreview(preview);
+      setSelectedSpotifyIds(new Set(preview.tracks.map((track) => track.id)));
+      setNotice(`Found ${preview.totalTracks} Spotify tracks in ${preview.playlistName}.`);
+    } catch (caught) {
+      setNotice(caught instanceof Error ? caught.message : "Spotify import failed.");
+    }
+  }
+
+  function toggleSpotifyTrack(id: string) {
+    setSelectedSpotifyIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function confirmSpotifyImport() {
+    if (!spotifyPreview) return;
+
+    let skippedDuplicates = 0;
+    const failedTracks = spotifyPreview.unavailableTracks;
+    const chosen = spotifyPreview.tracks.filter((track) => selectedSpotifyIds.has(track.id));
+    const existingAndIncoming = [...songs];
+    const imported: Song[] = [];
+
+    for (const track of chosen) {
+      if (findImportDuplicate(track, existingAndIncoming)) {
+        skippedDuplicates += 1;
+        continue;
+      }
+      const nextRank = existingAndIncoming.length + 1;
+      const rankedTrack = { ...track, manualRank: nextRank };
+      imported.push(rankedTrack);
+      existingAndIncoming.push(rankedTrack);
+    }
+
+    setSongs(rerank(existingAndIncoming));
+    setNotice(
+      `Spotify import summary: ${spotifyPreview.totalTracks} found, ${imported.length} imported, ${skippedDuplicates} skipped duplicates, ${failedTracks} unavailable.`
+    );
+  }
+
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-6 px-4 py-5 sm:px-6 lg:px-8">
       <header className="flex flex-col gap-5 rounded-none py-3 md:flex-row md:items-center md:justify-between">
@@ -198,6 +279,9 @@ export default function Home() {
         </div>
         <div className="flex flex-wrap items-center gap-3">
           <InstallButton />
+          <button onClick={() => setView("spotify")} className="inline-flex items-center gap-2 rounded-lg border border-acid/30 bg-acid/10 px-4 py-3 text-sm font-semibold text-acid transition hover:bg-acid/15">
+            <Music2 size={18} /> {spotifyConnected ? "Spotify Connected" : "Connect Spotify"}
+          </button>
           <button onClick={() => setView("data")} className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-4 py-3 text-sm font-semibold text-white transition hover:bg-white/10">
             <Upload size={18} /> Import
           </button>
@@ -217,6 +301,7 @@ export default function Home() {
           ["top100", "Top 100", Medal],
           ["compare", "Compare", Shuffle],
           ["progress", "Progress", BarChart3],
+          ["spotify", "Spotify", Music2],
           ["data", "Data", Download]
         ] satisfies NavItem[]).map(([id, label, Icon]) => (
           <button
@@ -292,7 +377,7 @@ export default function Home() {
                   <span className="text-xs font-bold uppercase tracking-[0.2em] text-acid">Choose</span>
                   <h3 className="mt-4 text-2xl font-black text-white">{song.title}</h3>
                   <p className="text-zinc-300">{song.artist}</p>
-                  <p className="mt-4 text-sm text-zinc-400">{song.album} · {song.year} · {song.genre}</p>
+                  <p className="mt-4 text-sm text-zinc-400">{song.album} / {song.year} / {song.genre}</p>
                   <p className="mt-4 line-clamp-3 text-sm leading-6 text-zinc-300">{song.notes}</p>
                 </button>
               ))}
@@ -304,6 +389,22 @@ export default function Home() {
       )}
 
       {view === "progress" && <ProgressDashboard songs={songs} weights={weights} completion={completion} />}
+
+      {view === "spotify" && (
+        <SpotifyImportPanel
+          connected={spotifyConnected}
+          preview={spotifyPreview}
+          selectedIds={selectedSpotifyIds}
+          existingSongs={songs}
+          onConnect={connectSpotify}
+          onDisconnect={disconnectFromSpotify}
+          onPreview={loadSpotifyPreview}
+          onToggleTrack={toggleSpotifyTrack}
+          onSelectAll={() => spotifyPreview && setSelectedSpotifyIds(new Set(spotifyPreview.tracks.map((track) => track.id)))}
+          onSelectNone={() => setSelectedSpotifyIds(new Set())}
+          onConfirm={confirmSpotifyImport}
+        />
+      )}
 
       {view === "data" && (
         <section className="grid gap-5 md:grid-cols-2">
@@ -330,6 +431,161 @@ export default function Home() {
         </section>
       )}
     </main>
+  );
+}
+
+function SpotifyImportPanel({
+  connected,
+  preview,
+  selectedIds,
+  existingSongs,
+  onConnect,
+  onDisconnect,
+  onPreview,
+  onToggleTrack,
+  onSelectAll,
+  onSelectNone,
+  onConfirm
+}: {
+  connected: boolean;
+  preview: SpotifyPlaylistPreview | null;
+  selectedIds: Set<string>;
+  existingSongs: Song[];
+  onConnect: () => void;
+  onDisconnect: () => void;
+  onPreview: (playlistUrl: string) => Promise<void>;
+  onToggleTrack: (id: string) => void;
+  onSelectAll: () => void;
+  onSelectNone: () => void;
+  onConfirm: () => void;
+}) {
+  const [playlistUrl, setPlaylistUrl] = useState("");
+  const [loading, setLoading] = useState(false);
+  const hasClientId = Boolean(getSpotifyClientId());
+  const duplicateCount = preview?.tracks.filter((track) => findImportDuplicate(track, existingSongs)).length ?? 0;
+
+  async function fetchPreview() {
+    setLoading(true);
+    try {
+      await onPreview(playlistUrl);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <section className="grid gap-5 lg:grid-cols-[0.8fr_1.2fr]">
+      <div className="glass rounded-lg p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-2xl font-bold text-white">Spotify Import</h2>
+            <p className="mt-2 text-sm leading-6 text-zinc-400">Connect with PKCE, paste a playlist URL, preview every paginated track, then choose what joins your archive.</p>
+          </div>
+          <span className={`rounded-md px-3 py-2 text-xs font-black ${connected ? "bg-acid/10 text-acid" : "bg-white/10 text-zinc-300"}`}>
+            {connected ? "Connected" : "Disconnected"}
+          </span>
+        </div>
+
+        {!hasClientId && (
+          <div className="mt-5 rounded-lg border border-pulse/30 bg-pulse/10 p-4 text-sm leading-6 text-pulse">
+            Missing NEXT_PUBLIC_SPOTIFY_CLIENT_ID. Add it to .env.local and restart the dev server.
+          </div>
+        )}
+
+        <div className="mt-5 flex flex-wrap gap-3">
+          <button
+            onClick={onConnect}
+            disabled={!hasClientId}
+            className="inline-flex items-center gap-2 rounded-lg bg-acid px-4 py-3 text-sm font-black text-zinc-950 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Music2 size={18} /> Connect Spotify
+          </button>
+          {connected && (
+            <button onClick={onDisconnect} className="rounded-lg border border-white/10 px-4 py-3 text-sm font-bold text-white hover:bg-white/10">
+              Disconnect
+            </button>
+          )}
+        </div>
+
+        <label className="mt-6 block text-sm font-semibold text-zinc-300">
+          Playlist URL or URI
+          <input
+            value={playlistUrl}
+            onChange={(event) => setPlaylistUrl(event.target.value)}
+            placeholder="https://open.spotify.com/playlist/... or spotify:playlist:..."
+            className="mt-2 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-3 text-white outline-none transition placeholder:text-zinc-600 focus:border-acid/60"
+          />
+        </label>
+        <button
+          onClick={fetchPreview}
+          disabled={!connected || loading || !playlistUrl.trim()}
+          className="mt-4 inline-flex w-full items-center justify-center gap-2 rounded-lg bg-white px-4 py-3 text-sm font-black text-zinc-950 transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {loading ? <Loader2 className="animate-spin" size={18} /> : <Import size={18} />}
+          {loading ? "Loading playlist" : "Preview Tracks"}
+        </button>
+
+        {preview && (
+          <div className="mt-5 rounded-lg border border-white/10 bg-black/20 p-4">
+            <p className="text-xs font-bold uppercase tracking-[0.18em] text-zinc-500">Import Summary</p>
+            <h3 className="mt-2 text-xl font-black text-white">{preview.playlistName}</h3>
+            <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
+              <SummaryPill label="Total" value={String(preview.totalTracks)} />
+              <SummaryPill label="Previewed" value={String(preview.tracks.length)} />
+              <SummaryPill label="Duplicates" value={String(duplicateCount)} />
+              <SummaryPill label="Unavailable" value={String(preview.unavailableTracks)} />
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="glass rounded-lg p-4 sm:p-5">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-2xl font-bold text-white">Track Preview</h2>
+            <p className="text-sm text-zinc-400">{preview ? `${selectedIds.size} selected for import` : "Load a playlist to review tracks first."}</p>
+          </div>
+          {preview && (
+            <div className="flex gap-2">
+              <button onClick={onSelectAll} className="rounded-lg border border-white/10 px-3 py-2 text-sm font-bold text-white hover:bg-white/10">All</button>
+              <button onClick={onSelectNone} className="rounded-lg border border-white/10 px-3 py-2 text-sm font-bold text-white hover:bg-white/10">None</button>
+              <button onClick={onConfirm} className="rounded-lg bg-acid px-3 py-2 text-sm font-black text-zinc-950 hover:brightness-110">Import</button>
+            </div>
+          )}
+        </div>
+
+        <div className="mt-4 max-h-[42rem] space-y-3 overflow-y-auto pr-1">
+          {!preview && <div className="rounded-lg border border-dashed border-white/15 p-8 text-center text-zinc-400">No playlist preview yet.</div>}
+          {preview?.tracks.map((track) => {
+            const duplicate = Boolean(findImportDuplicate(track, existingSongs));
+            const selected = selectedIds.has(track.id);
+            return (
+              <label key={track.id} className={`flex cursor-pointer gap-3 rounded-lg border p-3 transition ${selected ? "border-acid/40 bg-acid/10" : "border-white/10 bg-white/[0.035] hover:bg-white/[0.06]"}`}>
+                <input type="checkbox" checked={selected} onChange={() => onToggleTrack(track.id)} className="mt-5 size-4 accent-lime-300" />
+                <AlbumArt song={track} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="truncate font-bold text-white">{track.title}</h3>
+                    {duplicate && <span className="rounded bg-pulse/15 px-2 py-1 text-xs font-bold text-pulse">Duplicate</span>}
+                  </div>
+                  <p className="truncate text-sm text-zinc-300">{track.artist}</p>
+                  <p className="mt-1 text-xs text-zinc-500">{track.album} / {track.year}</p>
+                </div>
+              </label>
+            );
+          })}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SummaryPill({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg bg-white/[0.04] p-3">
+      <p className="text-xs text-zinc-500">{label}</p>
+      <p className="mt-1 text-lg font-black text-white">{value}</p>
+    </div>
   );
 }
 
@@ -428,17 +684,32 @@ function RankedList({ songs, weights, title, subtitle, onEdit, onDelete }: { son
   );
 }
 
+function AlbumArt({ song }: { song: Song }) {
+  if (song.albumArtUrl) {
+    return <img src={song.albumArtUrl} alt="" className="size-12 shrink-0 rounded-md border border-white/10 object-cover" loading="lazy" />;
+  }
+
+  return (
+    <div className="grid size-12 shrink-0 place-items-center rounded-md border border-white/10 bg-white/[0.04] text-acid">
+      <Music2 size={20} />
+    </div>
+  );
+}
+
 function SongRow({ song, rank, score, onEdit, onDelete }: { song: Song; rank: number; score: number; onEdit: (song: Song) => void; onDelete: (id: string) => void }) {
   return (
     <article className="rounded-lg border border-white/10 bg-white/[0.035] p-3 transition hover:border-white/20 hover:bg-white/[0.06]">
       <div className="flex items-start gap-3">
-        <div className="grid size-10 shrink-0 place-items-center rounded-md bg-white text-sm font-black text-zinc-950">{rank}</div>
+        <div className="relative shrink-0">
+          <AlbumArt song={song} />
+          <span className="absolute -bottom-1 -right-1 grid size-6 place-items-center rounded bg-white text-[0.65rem] font-black text-zinc-950">{rank}</span>
+        </div>
         <div className="min-w-0 flex-1">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
             <div className="min-w-0">
               <h3 className="truncate text-base font-bold text-white">{song.title}</h3>
               <p className="truncate text-sm text-zinc-300">{song.artist}</p>
-              <p className="mt-1 text-xs text-zinc-500">{song.album} · {song.year} · {song.genre}</p>
+              <p className="mt-1 text-xs text-zinc-500">{song.album} / {song.year} / {song.genre || song.source || "manual"}</p>
             </div>
             <div className="flex items-center gap-2">
               <span className="rounded-md bg-acid/10 px-2 py-1 text-xs font-black text-acid">{score.toFixed(1)}</span>
@@ -463,10 +734,13 @@ function SortableSong({ song, score, onEdit, onDelete }: { song: Song; score: nu
           <button {...attributes} {...listeners} aria-label={`Drag ${song.title}`} className="cursor-grab rounded-md p-2 text-zinc-400 hover:bg-white/10 hover:text-white">
             <GripVertical size={18} />
           </button>
-          <div className="grid size-10 place-items-center rounded-md bg-white text-sm font-black text-zinc-950">{song.manualRank}</div>
+          <div className="relative shrink-0">
+            <AlbumArt song={song} />
+            <span className="absolute -bottom-1 -right-1 grid size-6 place-items-center rounded bg-white text-[0.65rem] font-black text-zinc-950">{song.manualRank}</span>
+          </div>
           <div className="min-w-0 flex-1">
             <h3 className="truncate font-bold text-white">{song.title}</h3>
-            <p className="truncate text-sm text-zinc-400">{song.artist} · {song.album}</p>
+            <p className="truncate text-sm text-zinc-400">{song.artist} / {song.album}</p>
           </div>
           <span className="hidden rounded-md bg-acid/10 px-2 py-1 text-xs font-black text-acid sm:inline">{score.toFixed(1)}</span>
           <button aria-label={`Edit ${song.title}`} onClick={() => onEdit(song)} className="rounded-md p-2 text-zinc-300 hover:bg-white/10 hover:text-white"><Pencil size={16} /></button>
@@ -515,7 +789,7 @@ function ProgressDashboard({ songs, weights, completion }: { songs: Song[]; weig
         <div className="mt-4 grid gap-3 md:grid-cols-2">
           {topCriteria.map((criterion) => (
             <div key={criterion.key} className="rounded-lg border border-white/10 bg-black/20 p-3">
-              <div className="flex justify-between text-sm"><span className="font-semibold text-white">{criterion.label}</span><span className="text-zinc-400">Avg {criterion.average.toFixed(1)} · W {criterion.weight}</span></div>
+              <div className="flex justify-between text-sm"><span className="font-semibold text-white">{criterion.label}</span><span className="text-zinc-400">Avg {criterion.average.toFixed(1)} / W {criterion.weight}</span></div>
               <div className="mt-2 h-2 rounded-full bg-white/10"><div className="h-full rounded-full bg-acid" style={{ width: `${criterion.average * 10}%` }} /></div>
             </div>
           ))}
