@@ -7,10 +7,12 @@ TrackForge is a local-first Next.js PWA for building a personal Top 100 favorite
 ```bash
 npm install
 cp .env.example .env.local
-npm run dev -- -p 3001
+npm run dev:spotify
 ```
 
-Open `http://127.0.0.1:3001`.
+Open `http://127.0.0.1:3001/?view=spotify`.
+
+TrackForge reads runtime Spotify values from `.env.local`. `.env.example` is only a template.
 
 ## Build
 
@@ -59,7 +61,7 @@ NEXT_PUBLIC_APP_URL=http://127.0.0.1:3001
 
 7. Paste your Spotify Client ID into `.env.local`.
 8. Restart the dev server after changing `.env.local`.
-9. Open TrackForge and go to the Spotify tab.
+9. Run `npm run dev:spotify`.
 10. Click **Connect Spotify** and approve access.
 11. Paste a playlist URL like `https://open.spotify.com/playlist/{id}` or a URI like `spotify:playlist:{id}`.
 12. Preview the tracks, select or deselect entries, then confirm the import.
@@ -78,6 +80,22 @@ Use **Spotify > My Playlists > Update Playlist** to sync later:
 - Tracks removed from Spotify are not deleted from TrackForge; they get a **No longer in Spotify playlist** badge.
 - **Spotify > Sync History** shows Imported and Synced timeline events.
 - **Spotify > Debug** shows the current app URL, redirect URI, connection state, token expiry, and scopes.
+
+### Troubleshooting: `client_id: Invalid`
+
+If Spotify shows `client_id: Invalid`, check this list:
+
+- `.env.local` exists in the project root, not only `.env.example`.
+- `NEXT_PUBLIC_SPOTIFY_CLIENT_ID` is set in `.env.local`.
+- The dev server was restarted after editing `.env.local`.
+- You started the app with `npm run dev:spotify`.
+- You opened `http://127.0.0.1:3001/?view=spotify`, not `localhost`.
+- Spotify Dashboard has this exact redirect URI:
+  - `http://127.0.0.1:3001/callback`
+- In TrackForge, open **Spotify > Debug** and confirm:
+  - Client ID loaded: Yes
+  - Redirect URI: `http://127.0.0.1:3001/callback`
+  - Uses localhost: No
 
 ## Future extension points
 

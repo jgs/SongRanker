@@ -611,7 +611,7 @@ function SpotifyImportPanel({
 
         {!hasClientId && (
           <div className="mt-5 rounded-lg border border-pulse/30 bg-pulse/10 p-4 text-sm leading-6 text-pulse">
-            Missing NEXT_PUBLIC_SPOTIFY_CLIENT_ID. Add it to .env.local and restart the dev server.
+            Spotify Client ID is missing. Create .env.local and restart npm run dev.
           </div>
         )}
 
@@ -828,8 +828,12 @@ function DebugPanel({
   callbackAvailable: boolean;
 }) {
   const rows = [
+    ["Client ID loaded", diagnostics.clientIdLoaded ? "Yes" : "No"],
+    ["Client ID preview", diagnostics.clientIdPreview ?? "Missing"],
     ["Current app URL", diagnostics.appUrl],
     ["Redirect URI", diagnostics.redirectUri],
+    ["Current origin", diagnostics.currentOrigin],
+    ["Uses localhost", diagnostics.usesLocalhost ? "Yes" : "No"],
     ["Connected", diagnostics.connected ? "Yes" : "No"],
     ["Token expiry", diagnostics.tokenExpiry],
     ["Scopes", diagnostics.scopes.join(", ")],

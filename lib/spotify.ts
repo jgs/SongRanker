@@ -72,6 +72,10 @@ export function getAppUrl() {
   return configured?.replace(/\/$/, "") ?? "";
 }
 
+export function getConfiguredAppUrl() {
+  return process.env.NEXT_PUBLIC_APP_URL?.trim().replace(/\/$/, "") ?? "";
+}
+
 export function getRedirectUri() {
   const baseUrl = getAppUrl();
   return `${baseUrl}/callback`;
@@ -83,9 +87,17 @@ export function getSpotifyScopes() {
 
 export function getSpotifyDiagnostics() {
   const tokens = getStoredSpotifyTokens();
+  const clientId = getSpotifyClientId();
+  const currentOrigin = typeof window !== "undefined" ? window.location.origin : "";
+  const appUrl = getAppUrl();
+  const redirectUri = getRedirectUri();
   return {
-    appUrl: getAppUrl(),
-    redirectUri: getRedirectUri(),
+    appUrl,
+    redirectUri,
+    currentOrigin,
+    usesLocalhost: appUrl.includes("localhost") || redirectUri.includes("localhost") || currentOrigin.includes("localhost"),
+    clientIdLoaded: Boolean(clientId),
+    clientIdPreview: previewClientId(clientId),
     connected: Boolean(tokens),
     tokenExpiry: tokens ? new Date(tokens.expiresAt).toLocaleString() : "Not connected",
     scopes: tokens?.scopes?.length ? tokens.scopes : SCOPES
@@ -120,6 +132,15 @@ export async function startSpotifyLogin() {
   const challenge = await generateCodeChallenge(verifier);
   const state = crypto.randomUUID();
   const redirectUri = getRedirectUri();
+
+  if (process.env.NODE_ENV === "development") {
+    console.log({
+      spotifyClientIdPresent: Boolean(clientId),
+      spotifyClientIdPreview: previewClientId(clientId),
+      appUrl: getAppUrl(),
+      redirectUri
+    });
+  }
 
   window.localStorage.setItem(PKCE_KEY, JSON.stringify({ verifier, state, redirectUri }));
 
@@ -326,7 +347,16 @@ function spotifyTrackToSong(track: SpotifyTrack, playlistName: string, manualRan
 
 function validateSpotifySetup(clientId: string) {
   if (!clientId) {
-    throw new Error("Missing NEXT_PUBLIC_SPOTIFY_CLIENT_ID. Add it to .env.local, restart Next.js, then try again.");
+    throw new Error("Spotify Client ID is missing. Create .env.local and restart npm run dev.");
+  }
+
+  if (!/^[a-f0-9]{32}$/.test(clientId)) {
+    throw new Error("Spotify Client ID looks invalid. It should be 32 lowercase hex characters. Check NEXT_PUBLIC_SPOTIFY_CLIENT_ID in .env.local and restart npm run dev.");
+  }
+
+  const configuredAppUrl = getConfiguredAppUrl();
+  if (!configuredAppUrl) {
+    throw new Error("NEXT_PUBLIC_APP_URL is missing. Add NEXT_PUBLIC_APP_URL=http://127.0.0.1:3001 to .env.local and restart npm run dev.");
   }
 
   const redirectUri = getRedirectUri();
@@ -345,13 +375,25 @@ function validateSpotifySetup(clientId: string) {
     throw new Error("Spotify local redirects must use 127.0.0.1, not localhost. Set NEXT_PUBLIC_APP_URL=http://127.0.0.1:3001.");
   }
 
+  if (process.env.NODE_ENV === "development" && redirectUri !== "http://127.0.0.1:3001/callback") {
+    throw new Error(`Spotify local redirect URI must be exactly http://127.0.0.1:3001/callback. Current value: ${redirectUri}`);
+  }
+
   if (parsed.pathname !== "/callback") {
     throw new Error(`Spotify redirect URI must end with /callback. Current value: ${redirectUri}`);
+  }
+
+  if (parsed.protocol === "http:" && parsed.hostname !== "127.0.0.1") {
+    throw new Error("Spotify only allows plain HTTP for loopback IPs. Use http://127.0.0.1:3001 locally or HTTPS in production.");
   }
 }
 
 function hashPlaylistTracks(tracks: Song[]) {
   return tracks.map((track) => track.spotifyId ?? normalizeSongKey(track)).join("|");
+}
+
+function previewClientId(clientId: string) {
+  return clientId ? `${clientId.slice(0, 6)}...${clientId.slice(-4)}` : null;
 }
 
 function generateCodeVerifier() {
