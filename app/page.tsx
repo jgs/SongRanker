@@ -27,6 +27,8 @@ import { InstallButton } from "@/components/install-button";
 import {
   CRITERIA,
   DEFAULT_WEIGHTS,
+  PlaylistImport,
+  PlaylistSyncEvent,
   Song,
   Weights,
   calculateScore,
@@ -43,8 +45,11 @@ import {
   disconnectSpotify,
   fetchSpotifyPlaylistPreview,
   findImportDuplicate,
+  getRedirectUri,
+  getSpotifyDiagnostics,
   getSpotifyClientId,
   getStoredSpotifyTokens,
+  normalizeSongKey,
   startSpotifyLogin
 } from "@/lib/spotify";
 
@@ -73,12 +78,16 @@ export default function Home() {
   const [spotifyConnected, setSpotifyConnected] = useState(false);
   const [spotifyPreview, setSpotifyPreview] = useState<SpotifyPlaylistPreview | null>(null);
   const [selectedSpotifyIds, setSelectedSpotifyIds] = useState<Set<string>>(new Set());
+  const [playlistImports, setPlaylistImports] = useState<PlaylistImport[]>([]);
+  const [syncHistory, setSyncHistory] = useState<PlaylistSyncEvent[]>([]);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
 
   useEffect(() => {
     const library = loadLibrary();
     setSongs(library.songs);
     setWeights(library.weights);
+    setPlaylistImports(library.playlistImports);
+    setSyncHistory(library.syncHistory);
     setSpotifyConnected(Boolean(getStoredSpotifyTokens()));
     const params = new URLSearchParams(window.location.search);
     const requestedView = params.get("view");
@@ -89,9 +98,9 @@ export default function Home() {
 
   useEffect(() => {
     if (loaded) {
-      saveLibrary({ songs, weights });
+      saveLibrary({ songs, weights, playlistImports, syncHistory });
     }
-  }, [loaded, songs, weights]);
+  }, [loaded, songs, weights, playlistImports, syncHistory]);
 
   const rankedSongs = useMemo(() => {
     return [...songs].sort((a, b) => a.manualRank - b.manualRank);
@@ -240,24 +249,108 @@ export default function Home() {
     let skippedDuplicates = 0;
     const failedTracks = spotifyPreview.unavailableTracks;
     const chosen = spotifyPreview.tracks.filter((track) => selectedSpotifyIds.has(track.id));
-    const existingAndIncoming = [...songs];
+    let existingAndIncoming = [...songs];
     const imported: Song[] = [];
 
     for (const track of chosen) {
-      if (findImportDuplicate(track, existingAndIncoming)) {
+      const duplicate = findImportDuplicate(track, existingAndIncoming);
+      if (duplicate) {
+        existingAndIncoming = connectSongToPlaylist(existingAndIncoming, duplicate.id, spotifyPreview.spotifyPlaylistId);
         skippedDuplicates += 1;
         continue;
       }
-      const nextRank = existingAndIncoming.length + 1;
-      const rankedTrack = { ...track, manualRank: nextRank };
+      const nextRank = getNextManualRank(existingAndIncoming);
+      const rankedTrack = {
+        ...track,
+        manualRank: nextRank,
+        spotifyPlaylistIds: [spotifyPreview.spotifyPlaylistId],
+        importedAt: new Date().toISOString(),
+        removedFromPlaylist: false
+      };
       imported.push(rankedTrack);
       existingAndIncoming.push(rankedTrack);
     }
 
-    setSongs(rerank(existingAndIncoming));
+    const now = new Date().toISOString();
+    const playlistRecord = toPlaylistImport(spotifyPreview, imported.length, now);
+    const event = toSyncEvent({
+      playlistImportId: playlistRecord.id,
+      type: "imported",
+      date: now,
+      changesCount: imported.length,
+      importedTracks: imported.length,
+      skippedDuplicates,
+      removedTracks: 0,
+      totalTracks: spotifyPreview.totalTracks,
+      message: `Imported ${imported.length} songs from ${spotifyPreview.playlistName}.`
+    });
+
+    setSongs(existingAndIncoming);
+    setPlaylistImports((current) => upsertPlaylistImport(current, playlistRecord));
+    setSyncHistory((current) => [event, ...current]);
     setNotice(
       `Spotify import summary: ${spotifyPreview.totalTracks} found, ${imported.length} imported, ${skippedDuplicates} skipped duplicates, ${failedTracks} unavailable.`
     );
+  }
+
+  async function syncPlaylist(playlist: PlaylistImport) {
+    try {
+      setNotice(`Syncing ${playlist.playlistName}...`);
+      const preview = await fetchSpotifyPlaylistPreview(`spotify:playlist:${playlist.spotifyPlaylistId}`);
+      let skippedDuplicates = 0;
+      let removedTracks = 0;
+      let nextSongs = [...songs];
+      const imported: Song[] = [];
+      const currentKeys = new Set(preview.tracks.map(playlistSongKey));
+
+      for (const track of preview.tracks) {
+        const duplicate = findImportDuplicate(track, nextSongs);
+        if (duplicate) {
+          const alreadyConnected = duplicate.spotifyPlaylistIds?.includes(preview.spotifyPlaylistId);
+          nextSongs = connectSongToPlaylist(nextSongs, duplicate.id, preview.spotifyPlaylistId);
+          if (!alreadyConnected) skippedDuplicates += 1;
+          continue;
+        }
+
+        const newTrack = {
+          ...track,
+          manualRank: getNextManualRank(nextSongs),
+          spotifyPlaylistIds: [preview.spotifyPlaylistId],
+          importedAt: new Date().toISOString(),
+          removedFromPlaylist: false
+        };
+        imported.push(newTrack);
+        nextSongs.push(newTrack);
+      }
+
+      nextSongs = nextSongs.map((song) => {
+        if (!song.spotifyPlaylistIds?.includes(preview.spotifyPlaylistId)) return song;
+        const removed = !currentKeys.has(playlistSongKey(song));
+        if (removed && !song.removedFromPlaylist) removedTracks += 1;
+        return { ...song, removedFromPlaylist: removed };
+      });
+
+      const now = new Date().toISOString();
+      const updatedPlaylist = toPlaylistImport(preview, playlist.importedTracks + imported.length, now, playlist.id, playlist.snapshotDate);
+      const event = toSyncEvent({
+        playlistImportId: playlist.id,
+        type: "synced",
+        date: now,
+        changesCount: imported.length + removedTracks,
+        importedTracks: imported.length,
+        skippedDuplicates,
+        removedTracks,
+        totalTracks: preview.totalTracks,
+        message: `+ ${imported.length} new songs, ${removedTracks} removed, ${skippedDuplicates} duplicates skipped.`
+      });
+
+      setSongs(nextSongs);
+      setPlaylistImports((current) => upsertPlaylistImport(current, updatedPlaylist));
+      setSyncHistory((current) => [event, ...current]);
+      setNotice(`Playlist sync summary: + ${imported.length} new songs, ${removedTracks} removed, ${skippedDuplicates} duplicates skipped.`);
+    } catch (caught) {
+      setNotice(caught instanceof Error ? caught.message : "Playlist sync failed.");
+    }
   }
 
   return (
@@ -396,6 +489,8 @@ export default function Home() {
           preview={spotifyPreview}
           selectedIds={selectedSpotifyIds}
           existingSongs={songs}
+          playlistImports={playlistImports}
+          syncHistory={syncHistory}
           onConnect={connectSpotify}
           onDisconnect={disconnectFromSpotify}
           onPreview={loadSpotifyPreview}
@@ -403,6 +498,7 @@ export default function Home() {
           onSelectAll={() => spotifyPreview && setSelectedSpotifyIds(new Set(spotifyPreview.tracks.map((track) => track.id)))}
           onSelectNone={() => setSelectedSpotifyIds(new Set())}
           onConfirm={confirmSpotifyImport}
+          onSyncPlaylist={syncPlaylist}
         />
       )}
 
@@ -439,18 +535,23 @@ function SpotifyImportPanel({
   preview,
   selectedIds,
   existingSongs,
+  playlistImports,
+  syncHistory,
   onConnect,
   onDisconnect,
   onPreview,
   onToggleTrack,
   onSelectAll,
   onSelectNone,
-  onConfirm
+  onConfirm,
+  onSyncPlaylist
 }: {
   connected: boolean;
   preview: SpotifyPlaylistPreview | null;
   selectedIds: Set<string>;
   existingSongs: Song[];
+  playlistImports: PlaylistImport[];
+  syncHistory: PlaylistSyncEvent[];
   onConnect: () => void;
   onDisconnect: () => void;
   onPreview: (playlistUrl: string) => Promise<void>;
@@ -458,11 +559,14 @@ function SpotifyImportPanel({
   onSelectAll: () => void;
   onSelectNone: () => void;
   onConfirm: () => void;
+  onSyncPlaylist: (playlist: PlaylistImport) => Promise<void>;
 }) {
   const [playlistUrl, setPlaylistUrl] = useState("");
   const [loading, setLoading] = useState(false);
+  const [section, setSection] = useState<"import" | "playlists" | "history" | "debug">("import");
   const hasClientId = Boolean(getSpotifyClientId());
   const duplicateCount = preview?.tracks.filter((track) => findImportDuplicate(track, existingSongs)).length ?? 0;
+  const diagnostics = getSpotifyDiagnostics();
 
   async function fetchPreview() {
     setLoading(true);
@@ -474,7 +578,26 @@ function SpotifyImportPanel({
   }
 
   return (
-    <section className="grid gap-5 lg:grid-cols-[0.8fr_1.2fr]">
+    <section className="space-y-5">
+      <div className="glass flex gap-2 overflow-x-auto rounded-lg p-2">
+        {[
+          ["import", "Import"],
+          ["playlists", "My Playlists"],
+          ["history", "Sync History"],
+          ["debug", "Debug"]
+        ].map(([id, label]) => (
+          <button
+            key={id}
+            onClick={() => setSection(id as "import" | "playlists" | "history" | "debug")}
+            className={`min-w-fit rounded-md px-4 py-2 text-sm font-bold transition ${section === id ? "bg-white text-zinc-950" : "text-zinc-300 hover:bg-white/10 hover:text-white"}`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {section === "import" && (
+    <div className="grid gap-5 lg:grid-cols-[0.8fr_1.2fr]">
       <div className="glass rounded-lg p-5">
         <div className="flex items-start justify-between gap-4">
           <div>
@@ -576,6 +699,18 @@ function SpotifyImportPanel({
           })}
         </div>
       </div>
+    </div>
+      )}
+
+      {section === "playlists" && <MyPlaylistsPanel playlists={playlistImports} songs={existingSongs} onSyncPlaylist={onSyncPlaylist} />}
+      {section === "history" && <SyncHistoryPanel history={syncHistory} playlists={playlistImports} />}
+      {section === "debug" && (
+        <DebugPanel
+          diagnostics={diagnostics}
+          hasClientId={hasClientId}
+          callbackAvailable={getRedirectUri().endsWith("/callback")}
+        />
+      )}
     </section>
   );
 }
@@ -586,6 +721,134 @@ function SummaryPill({ label, value }: { label: string; value: string }) {
       <p className="text-xs text-zinc-500">{label}</p>
       <p className="mt-1 text-lg font-black text-white">{value}</p>
     </div>
+  );
+}
+
+function MyPlaylistsPanel({
+  playlists,
+  songs,
+  onSyncPlaylist
+}: {
+  playlists: PlaylistImport[];
+  songs: Song[];
+  onSyncPlaylist: (playlist: PlaylistImport) => Promise<void>;
+}) {
+  const [syncingId, setSyncingId] = useState<string | null>(null);
+
+  async function sync(playlist: PlaylistImport) {
+    setSyncingId(playlist.id);
+    try {
+      await onSyncPlaylist(playlist);
+    } finally {
+      setSyncingId(null);
+    }
+  }
+
+  if (!playlists.length) {
+    return <div className="glass rounded-lg p-8 text-center text-zinc-400">No Spotify playlists tracked yet. Import a playlist to start syncing it over time.</div>;
+  }
+
+  return (
+    <section className="grid gap-4 md:grid-cols-2">
+      {playlists.map((playlist) => {
+        const importedSongs = songs.filter((song) => song.spotifyPlaylistIds?.includes(playlist.spotifyPlaylistId));
+        return (
+          <article key={playlist.id} className="glass rounded-lg p-4">
+            <div className="flex gap-4">
+              {playlist.imageUrl ? (
+                <img src={playlist.imageUrl} alt="" className="size-20 rounded-md border border-white/10 object-cover" />
+              ) : (
+                <div className="grid size-20 place-items-center rounded-md border border-white/10 bg-white/[0.04] text-acid"><Music2 size={28} /></div>
+              )}
+              <div className="min-w-0 flex-1">
+                <h3 className="truncate text-xl font-black text-white">{playlist.playlistName}</h3>
+                <p className="mt-1 text-sm text-zinc-400">{importedSongs.length} connected songs</p>
+                <p className="mt-2 text-xs text-zinc-500">Imported {formatDate(playlist.snapshotDate)}</p>
+                <p className="text-xs text-zinc-500">Last sync {formatDate(playlist.lastSync)}</p>
+              </div>
+            </div>
+            <div className="mt-4 flex items-center justify-between gap-3">
+              <span className="rounded-md bg-white/10 px-3 py-2 text-xs font-bold text-zinc-300">{playlist.totalTracks} Spotify tracks</span>
+              <button
+                onClick={() => sync(playlist)}
+                disabled={syncingId === playlist.id}
+                className="inline-flex items-center gap-2 rounded-lg bg-acid px-4 py-3 text-sm font-black text-zinc-950 hover:brightness-110 disabled:opacity-60"
+              >
+                {syncingId === playlist.id && <Loader2 className="animate-spin" size={16} />}
+                Update Playlist
+              </button>
+            </div>
+          </article>
+        );
+      })}
+    </section>
+  );
+}
+
+function SyncHistoryPanel({ history, playlists }: { history: PlaylistSyncEvent[]; playlists: PlaylistImport[] }) {
+  if (!history.length) {
+    return <div className="glass rounded-lg p-8 text-center text-zinc-400">No playlist history yet. Imports and syncs will appear here.</div>;
+  }
+
+  return (
+    <section className="glass rounded-lg p-5">
+      <div className="mb-4 grid gap-3 sm:grid-cols-3">
+        <SummaryPill label="Total imports" value={String(history.filter((event) => event.type === "imported").length)} />
+        <SummaryPill label="Changes" value={String(history.reduce((sum, event) => sum + event.changesCount, 0))} />
+        <SummaryPill label="Latest sync" value={formatDate(history[0]?.date)} />
+      </div>
+      <div className="space-y-3">
+        {history.map((event) => {
+          const playlist = playlists.find((item) => item.id === event.playlistImportId);
+          return (
+            <article key={event.id} className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p className="text-xs font-bold uppercase tracking-[0.18em] text-acid">{event.type}</p>
+                  <h3 className="mt-1 font-bold text-white">{playlist?.playlistName ?? "Spotify playlist"}</h3>
+                </div>
+                <span className="text-sm text-zinc-400">{formatDate(event.date)}</span>
+              </div>
+              <p className="mt-3 text-sm text-zinc-300">{event.message}</p>
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function DebugPanel({
+  diagnostics,
+  hasClientId,
+  callbackAvailable
+}: {
+  diagnostics: ReturnType<typeof getSpotifyDiagnostics>;
+  hasClientId: boolean;
+  callbackAvailable: boolean;
+}) {
+  const rows = [
+    ["Current app URL", diagnostics.appUrl],
+    ["Redirect URI", diagnostics.redirectUri],
+    ["Connected", diagnostics.connected ? "Yes" : "No"],
+    ["Token expiry", diagnostics.tokenExpiry],
+    ["Scopes", diagnostics.scopes.join(", ")],
+    ["Client ID", hasClientId ? "Configured" : "Missing"],
+    ["Callback", callbackAvailable ? "Available at /callback" : "Invalid"]
+  ];
+
+  return (
+    <section className="glass rounded-lg p-5">
+      <h2 className="text-2xl font-bold text-white">Spotify Debug</h2>
+      <div className="mt-4 divide-y divide-white/10 rounded-lg border border-white/10">
+        {rows.map(([label, value]) => (
+          <div key={label} className="grid gap-1 p-3 sm:grid-cols-[12rem_1fr]">
+            <span className="text-sm font-bold text-zinc-400">{label}</span>
+            <span className="break-all text-sm text-white">{value}</span>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -707,7 +970,10 @@ function SongRow({ song, rank, score, onEdit, onDelete }: { song: Song; rank: nu
         <div className="min-w-0 flex-1">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
             <div className="min-w-0">
-              <h3 className="truncate text-base font-bold text-white">{song.title}</h3>
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="truncate text-base font-bold text-white">{song.title}</h3>
+                {song.removedFromPlaylist && <span className="rounded bg-pulse/15 px-2 py-1 text-xs font-bold text-pulse">No longer in Spotify playlist</span>}
+              </div>
               <p className="truncate text-sm text-zinc-300">{song.artist}</p>
               <p className="mt-1 text-xs text-zinc-500">{song.album} / {song.year} / {song.genre || song.source || "manual"}</p>
             </div>
@@ -739,7 +1005,10 @@ function SortableSong({ song, score, onEdit, onDelete }: { song: Song; score: nu
             <span className="absolute -bottom-1 -right-1 grid size-6 place-items-center rounded bg-white text-[0.65rem] font-black text-zinc-950">{song.manualRank}</span>
           </div>
           <div className="min-w-0 flex-1">
-            <h3 className="truncate font-bold text-white">{song.title}</h3>
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="truncate font-bold text-white">{song.title}</h3>
+              {song.removedFromPlaylist && <span className="rounded bg-pulse/15 px-2 py-1 text-xs font-bold text-pulse">No longer in Spotify playlist</span>}
+            </div>
             <p className="truncate text-sm text-zinc-400">{song.artist} / {song.album}</p>
           </div>
           <span className="hidden rounded-md bg-acid/10 px-2 py-1 text-xs font-black text-acid sm:inline">{score.toFixed(1)}</span>
@@ -811,4 +1080,51 @@ function Stat({ icon, label, value, accent }: { icon: React.ReactNode; label: st
 
 function rerank(songs: Song[]) {
   return songs.map((song, index) => ({ ...song, manualRank: index + 1 }));
+}
+
+function getNextManualRank(songs: Song[]) {
+  return songs.length ? Math.max(...songs.map((song) => song.manualRank)) + 1 : 1;
+}
+
+function connectSongToPlaylist(songs: Song[], songId: string, spotifyPlaylistId: string) {
+  return songs.map((song) => {
+    if (song.id !== songId) return song;
+    const playlistIds = new Set(song.spotifyPlaylistIds ?? []);
+    playlistIds.add(spotifyPlaylistId);
+    return { ...song, spotifyPlaylistIds: [...playlistIds], removedFromPlaylist: false };
+  });
+}
+
+function toPlaylistImport(preview: SpotifyPlaylistPreview, importedTracks: number, date: string, existingId?: string, snapshotDate?: string): PlaylistImport {
+  return {
+    id: existingId ?? crypto.randomUUID(),
+    spotifyPlaylistId: preview.spotifyPlaylistId,
+    playlistName: preview.playlistName,
+    snapshotDate: snapshotDate ?? date,
+    totalTracks: preview.totalTracks,
+    importedTracks,
+    lastSync: date,
+    imageUrl: preview.imageUrl,
+    spotifySnapshotId: preview.spotifySnapshotId,
+    lastPlaylistHash: preview.playlistHash
+  };
+}
+
+function upsertPlaylistImport(playlists: PlaylistImport[], playlist: PlaylistImport) {
+  const existing = playlists.find((item) => item.spotifyPlaylistId === playlist.spotifyPlaylistId || item.id === playlist.id);
+  if (!existing) return [playlist, ...playlists];
+  return playlists.map((item) => (item.id === existing.id ? { ...playlist, id: existing.id } : item));
+}
+
+function toSyncEvent(input: Omit<PlaylistSyncEvent, "id">): PlaylistSyncEvent {
+  return { id: crypto.randomUUID(), ...input };
+}
+
+function playlistSongKey(song: Song) {
+  return song.spotifyId ? `spotify:${song.spotifyId}` : `fallback:${normalizeSongKey(song)}`;
+}
+
+function formatDate(value?: string) {
+  if (!value) return "Never";
+  return new Date(value).toLocaleString();
 }

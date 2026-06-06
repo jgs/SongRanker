@@ -11,18 +11,26 @@ export type SpotifyTokens = {
   accessToken: string;
   refreshToken?: string;
   expiresAt: number;
+  scopes: string[];
 };
 
 export type SpotifyPlaylistPreview = {
+  spotifyPlaylistId: string;
   playlistName: string;
   playlistUrl: string;
   totalTracks: number;
   unavailableTracks: number;
+  imageUrl?: string;
+  spotifySnapshotId?: string;
+  playlistHash: string;
   tracks: Song[];
 };
 
 type SpotifyPlaylist = {
+  id: string;
   name: string;
+  snapshot_id?: string;
+  images?: Array<{ url: string }>;
   external_urls?: { spotify?: string };
   tracks: {
     href: string;
@@ -57,6 +65,33 @@ export function getSpotifyClientId() {
   return process.env.NEXT_PUBLIC_SPOTIFY_CLIENT_ID ?? "";
 }
 
+export function getAppUrl() {
+  const configured = process.env.NEXT_PUBLIC_APP_URL?.trim();
+  if (process.env.NODE_ENV === "development" && configured) return configured.replace(/\/$/, "");
+  if (typeof window !== "undefined") return window.location.origin;
+  return configured?.replace(/\/$/, "") ?? "";
+}
+
+export function getRedirectUri() {
+  const baseUrl = getAppUrl();
+  return `${baseUrl}/callback`;
+}
+
+export function getSpotifyScopes() {
+  return SCOPES;
+}
+
+export function getSpotifyDiagnostics() {
+  const tokens = getStoredSpotifyTokens();
+  return {
+    appUrl: getAppUrl(),
+    redirectUri: getRedirectUri(),
+    connected: Boolean(tokens),
+    tokenExpiry: tokens ? new Date(tokens.expiresAt).toLocaleString() : "Not connected",
+    scopes: tokens?.scopes?.length ? tokens.scopes : SCOPES
+  };
+}
+
 export function getStoredSpotifyTokens(): SpotifyTokens | null {
   if (typeof window === "undefined") return null;
   const saved = window.localStorage.getItem(TOKEN_KEY);
@@ -79,9 +114,7 @@ export function disconnectSpotify() {
 
 export async function startSpotifyLogin() {
   const clientId = getSpotifyClientId();
-  if (!clientId) {
-    throw new Error("Missing NEXT_PUBLIC_SPOTIFY_CLIENT_ID. Add it to .env.local and restart Next.js.");
-  }
+  validateSpotifySetup(clientId);
 
   const verifier = generateCodeVerifier();
   const challenge = await generateCodeChallenge(verifier);
@@ -106,12 +139,16 @@ export async function startSpotifyLogin() {
 export async function completeSpotifyLogin(code: string, returnedState: string | null) {
   const clientId = getSpotifyClientId();
   const saved = window.localStorage.getItem(PKCE_KEY);
-  if (!clientId) throw new Error("Missing NEXT_PUBLIC_SPOTIFY_CLIENT_ID.");
-  if (!saved) throw new Error("Missing saved Spotify login state. Start the connection again.");
+  validateSpotifySetup(clientId);
+  if (!saved) throw new Error("Missing saved Spotify login state. Go back to TrackForge and click Connect Spotify again.");
 
   const pkce = JSON.parse(saved) as { verifier: string; state: string; redirectUri: string };
   if (!returnedState || returnedState !== pkce.state) {
-    throw new Error("Spotify login state did not match. Start the connection again.");
+    throw new Error("Spotify login state did not match. Restart Spotify connection from TrackForge.");
+  }
+
+  if (pkce.redirectUri !== getRedirectUri()) {
+    throw new Error(`Spotify redirect mismatch. Expected ${pkce.redirectUri}, but the app is now using ${getRedirectUri()}. Restart the connection.`);
   }
 
   const body = new URLSearchParams({
@@ -176,7 +213,7 @@ export async function fetchSpotifyPlaylistPreview(playlistInput: string): Promis
   }
 
   const playlist = await spotifyFetch<SpotifyPlaylist>(
-    `${API_URL}/playlists/${playlistId}?fields=name,external_urls.spotify,tracks(href,total,next,items(track(id,name,external_urls.spotify,artists(name),album(name,release_date,images))))`
+    `${API_URL}/playlists/${playlistId}?fields=id,name,snapshot_id,images,external_urls.spotify,tracks(href,total,next,items(track(id,name,external_urls.spotify,artists(name),album(name,release_date,images))))`
   );
 
   const allItems = [...playlist.tracks.items];
@@ -197,10 +234,14 @@ export async function fetchSpotifyPlaylistPreview(playlistInput: string): Promis
   });
 
   return {
+    spotifyPlaylistId: playlist.id,
     playlistName: playlist.name,
     playlistUrl: playlist.external_urls?.spotify ?? playlistInput,
     totalTracks: playlist.tracks.total,
     unavailableTracks,
+    imageUrl: playlist.images?.[0]?.url,
+    spotifySnapshotId: playlist.snapshot_id,
+    playlistHash: hashPlaylistTracks(tracks),
     tracks
   };
 }
@@ -253,14 +294,15 @@ async function postTokenRequest(body: URLSearchParams) {
     throw new Error(detail || "Spotify token exchange failed.");
   }
 
-  return response.json() as Promise<{ access_token: string; refresh_token?: string; expires_in: number }>;
+  return response.json() as Promise<{ access_token: string; refresh_token?: string; expires_in: number; scope?: string }>;
 }
 
-function toStoredTokens(payload: { access_token: string; refresh_token?: string; expires_in: number }, fallbackRefreshToken?: string): SpotifyTokens {
+function toStoredTokens(payload: { access_token: string; refresh_token?: string; expires_in: number; scope?: string }, fallbackRefreshToken?: string): SpotifyTokens {
   return {
     accessToken: payload.access_token,
     refreshToken: payload.refresh_token ?? fallbackRefreshToken,
-    expiresAt: Date.now() + payload.expires_in * 1000
+    expiresAt: Date.now() + payload.expires_in * 1000,
+    scopes: payload.scope?.split(" ").filter(Boolean) ?? SCOPES
   };
 }
 
@@ -277,12 +319,39 @@ function spotifyTrackToSong(track: SpotifyTrack, playlistName: string, manualRan
     spotifyId: track.id ?? undefined,
     albumArtUrl: track.album.images?.[0]?.url,
     source: "spotify",
-    manualRank
+    manualRank,
+    importedAt: new Date().toISOString()
   });
 }
 
-function getRedirectUri() {
-  return `${window.location.origin}/callback`;
+function validateSpotifySetup(clientId: string) {
+  if (!clientId) {
+    throw new Error("Missing NEXT_PUBLIC_SPOTIFY_CLIENT_ID. Add it to .env.local, restart Next.js, then try again.");
+  }
+
+  const redirectUri = getRedirectUri();
+  let parsed: URL;
+  try {
+    parsed = new URL(redirectUri);
+  } catch {
+    throw new Error(`Invalid Spotify redirect URI: ${redirectUri}. Check NEXT_PUBLIC_APP_URL.`);
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error(`Invalid Spotify redirect URI protocol: ${redirectUri}. Use http for local 127.0.0.1 or https in production.`);
+  }
+
+  if (process.env.NODE_ENV === "development" && parsed.hostname === "localhost") {
+    throw new Error("Spotify local redirects must use 127.0.0.1, not localhost. Set NEXT_PUBLIC_APP_URL=http://127.0.0.1:3001.");
+  }
+
+  if (parsed.pathname !== "/callback") {
+    throw new Error(`Spotify redirect URI must end with /callback. Current value: ${redirectUri}`);
+  }
+}
+
+function hashPlaylistTracks(tracks: Song[]) {
+  return tracks.map((track) => track.spotifyId ?? normalizeSongKey(track)).join("|");
 }
 
 function generateCodeVerifier() {

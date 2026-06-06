@@ -26,11 +26,42 @@ export type Song = {
   spotifyId?: string;
   albumArtUrl?: string;
   source?: "manual" | "spotify" | "csv" | "sample";
+  spotifyPlaylistIds?: string[];
+  importedAt?: string;
+  removedFromPlaylist?: boolean;
+};
+
+export type PlaylistImport = {
+  id: string;
+  spotifyPlaylistId: string;
+  playlistName: string;
+  snapshotDate: string;
+  totalTracks: number;
+  importedTracks: number;
+  lastSync: string;
+  imageUrl?: string;
+  spotifySnapshotId?: string;
+  lastPlaylistHash?: string;
+};
+
+export type PlaylistSyncEvent = {
+  id: string;
+  playlistImportId: string;
+  type: "imported" | "synced" | "updated";
+  date: string;
+  changesCount: number;
+  importedTracks: number;
+  skippedDuplicates: number;
+  removedTracks: number;
+  totalTracks: number;
+  message: string;
 };
 
 export type Library = {
   songs: Song[];
   weights: Weights;
+  playlistImports: PlaylistImport[];
+  syncHistory: PlaylistSyncEvent[];
 };
 
 const STORAGE_KEY = "trackforge.library.v1";
@@ -69,7 +100,10 @@ export function createSong(input: Partial<Song>): Song {
     manualRank: input.manualRank ?? 1,
     spotifyId: input.spotifyId,
     albumArtUrl: input.albumArtUrl,
-    source: input.source ?? "manual"
+    source: input.source ?? "manual",
+    spotifyPlaylistIds: input.spotifyPlaylistIds ?? [],
+    importedAt: input.importedAt,
+    removedFromPlaylist: input.removedFromPlaylist ?? false
   };
 }
 
@@ -87,11 +121,11 @@ export function sortedByWeightedScore(songs: Song[], weights: Weights) {
 }
 
 export function loadLibrary(): Library {
-  if (typeof window === "undefined") return { songs: sampleSongs, weights: DEFAULT_WEIGHTS };
+  if (typeof window === "undefined") return { songs: sampleSongs, weights: DEFAULT_WEIGHTS, playlistImports: [], syncHistory: [] };
 
   const saved = window.localStorage.getItem(STORAGE_KEY);
   if (!saved) {
-    const library = { songs: sampleSongs, weights: DEFAULT_WEIGHTS };
+    const library = { songs: sampleSongs, weights: DEFAULT_WEIGHTS, playlistImports: [], syncHistory: [] };
     saveLibrary(library);
     return library;
   }
@@ -100,10 +134,12 @@ export function loadLibrary(): Library {
     const parsed = JSON.parse(saved) as Library;
     return {
       songs: parsed.songs?.map((song, index) => createSong({ ...song, manualRank: song.manualRank ?? index + 1, source: song.source ?? "manual" })) ?? sampleSongs,
-      weights: { ...DEFAULT_WEIGHTS, ...parsed.weights }
+      weights: { ...DEFAULT_WEIGHTS, ...parsed.weights },
+      playlistImports: Array.isArray(parsed.playlistImports) ? parsed.playlistImports : [],
+      syncHistory: Array.isArray(parsed.syncHistory) ? parsed.syncHistory : []
     };
   } catch {
-    return { songs: sampleSongs, weights: DEFAULT_WEIGHTS };
+    return { songs: sampleSongs, weights: DEFAULT_WEIGHTS, playlistImports: [], syncHistory: [] };
   }
 }
 
@@ -128,6 +164,9 @@ export function serializeCsv(songs: Song[]) {
     "spotifyId",
     "albumArtUrl",
     "source",
+    "spotifyPlaylistIds",
+    "importedAt",
+    "removedFromPlaylist",
     ...CRITERIA.map((criterion) => criterion.key),
     "manualRank"
   ];
@@ -143,6 +182,9 @@ export function serializeCsv(songs: Song[]) {
       song.spotifyId ?? "",
       song.albumArtUrl ?? "",
       song.source ?? "manual",
+      song.spotifyPlaylistIds?.join("|") ?? "",
+      song.importedAt ?? "",
+      String(Boolean(song.removedFromPlaylist)),
       ...CRITERIA.map((criterion) => String(song.ratings[criterion.key])),
       String(song.manualRank)
     ];
@@ -176,6 +218,9 @@ export function deserializeCsv(csv: string) {
         spotifyId: record.spotifyId,
         albumArtUrl: record.albumArtUrl,
         source: "csv",
+        spotifyPlaylistIds: record.spotifyPlaylistIds ? record.spotifyPlaylistIds.split("|").filter(Boolean) : [],
+        importedAt: record.importedAt,
+        removedFromPlaylist: record.removedFromPlaylist === "true",
         ratings,
         manualRank: Number(record.manualRank) || index + 1
       });
